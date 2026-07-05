@@ -1,0 +1,294 @@
+{% extends "base.html" %}
+{% block title %}Documentos{% endblock %}
+{% block page %}documentos{% endblock %}
+{% block nav_docs %}active{% endblock %}
+{% block content %}
+
+<div class="docs-header">
+  <h1>Documentos</h1>
+  <div class="docs-toolbar">
+    <input type="text" id="doc-search" placeholder="Buscar por título o tema…">
+    <select id="doc-filter-type">
+      <option value="">Todos</option>
+      <option value="hegemonic">Hegemónico</option>
+      <option value="situated">Situado</option>
+    </select>
+    <select id="doc-filter-theme">
+      <option value="">Todos los temas</option>
+    </select>
+    <label class="upload-btn btn btn-jade">
+      ↑ Subir PDF / TXT
+      <input type="file" id="upload-file" accept=".pdf,.txt,.html" style="display:none">
+    </label>
+  </div>
+</div>
+
+<!-- Panel upload manual -->
+<div class="upload-panel hidden" id="upload-panel">
+  <div class="upload-form">
+    <span id="upload-filename">—</span>
+    <select id="upload-type">
+      <option value="hegemonic">Hegemónico</option>
+      <option value="situated">Situado</option>
+    </select>
+    <input type="text" id="upload-theme" placeholder="Tema (opcional)">
+    <button class="btn btn-jade" id="btn-do-upload">Subir y analizar</button>
+    <button class="btn btn-ghost" onclick="cancelUpload()">Cancelar</button>
+  </div>
+</div>
+
+<!-- Lista de documentos -->
+<div id="docs-container">
+  <div class="loading">Cargando documentos…</div>
+</div>
+
+<!-- Panel análisis lateral -->
+<div class="analysis-panel hidden" id="analysis-panel">
+  <div class="analysis-header">
+    <h3 id="analysis-doc-title">Análisis</h3>
+    <button class="btn-close" onclick="cerrarAnalisis()">✕</button>
+  </div>
+  <div class="analysis-tabs">
+    <button class="atab active" data-type="summary"  onclick="runAnalysis('summary')">Resumen</button>
+    <button class="atab"        data-type="keywords" onclick="runAnalysis('keywords')">Keywords</button>
+    <button class="atab"        data-type="entities" onclick="runAnalysis('entities')">Entidades</button>
+    <button class="atab"        data-type="bias"     onclick="runAnalysis('bias')">Sesgo</button>
+  </div>
+  <div id="analysis-result" class="analysis-result">
+    <div class="loading">Selecciona un tipo de análisis…</div>
+  </div>
+  <div class="analysis-actions">
+    <button class="btn btn-jade btn-sm" onclick="crearNotaDesdeAnalisis()">→ Guardar en Cuaderno</button>
+  </div>
+</div>
+
+<script>
+const api = {
+  async get(p) { return (await fetch(p)).json(); },
+  async post(p, b) { return (await fetch(p, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(b)})).json(); },
+  async del(p)  { return (await fetch(p, {method:'DELETE'})).json(); },
+};
+const $ = id => document.getElementById(id);
+const esc = s => String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const fmt = iso => iso ? new Date(iso).toLocaleDateString('es-MX',{day:'2-digit',month:'short',year:'2-digit'}) : '—';
+
+let allDocs = [];
+let currentDocId = null;
+let currentAnalysis = null;
+
+// ── Carga inicial ─────────────────────────────────────────
+async function init() {
+  allDocs = await api.get('/api/rag/documents/');
+  const themes = await api.get('/api/rag/themes/');
+
+  // Poblar selector de temas
+  const sel = $('doc-filter-theme');
+  themes.forEach(t => {
+    const opt = document.createElement('option');
+    opt.value = t; opt.textContent = t;
+    sel.appendChild(opt);
+  });
+
+  renderDocs(allDocs);
+  bindFilters();
+  bindUpload();
+}
+
+// ── Render ────────────────────────────────────────────────
+function renderDocs(docs) {
+  if (!docs.length) {
+    $('docs-container').innerHTML = '<div class="empty" style="padding:40px">No hay documentos todavía. Descarga desde Investigar o sube un PDF aquí.</div>';
+    return;
+  }
+
+  // Agrupar por tema
+  const porTema = {};
+  docs.forEach(d => {
+    const t = d.theme || 'Sin tema';
+    if (!porTema[t]) porTema[t] = [];
+    porTema[t].push(d);
+  });
+
+  let html = '';
+  Object.entries(porTema).sort().forEach(([tema, docs]) => {
+    html += `<div class="doc-section">
+      <div class="doc-section-title">${esc(tema)} <span class="doc-count">${docs.length}</span></div>
+      <div class="doc-cards">
+        ${docs.map(d => docCard(d)).join('')}
+      </div>
+    </div>`;
+  });
+
+  $('docs-container').innerHTML = html;
+}
+
+function docCard(d) {
+  const tipo = d.source_type === 'hegemonic' ? 'HEG' : 'SIT';
+  const clase = d.source_type === 'hegemonic' ? 'badge-heg' : 'badge-sit';
+  return `
+    <div class="doc-card" id="doc-${d.id}">
+      <div class="doc-card-top">
+        <span class="doc-badge ${clase}">${tipo}</span>
+        <span class="doc-date">${fmt(d.date_downloaded)}</span>
+      </div>
+      <div class="doc-title">${esc(d.title || d.source || '—')}</div>
+      <div class="doc-source">${esc((d.source||'').slice(0,60))}${(d.source||'').length > 60 ? '…' : ''}</div>
+      <div class="doc-actions">
+        <button class="btn btn-jade btn-sm" onclick="abrirAnalisis(${d.id}, '${esc(d.title||'Doc #'+d.id)}')">Analizar</button>
+        <button class="btn btn-ghost btn-sm" onclick="eliminarDoc(${d.id})">✕</button>
+      </div>
+    </div>`;
+}
+
+// ── Filtros ───────────────────────────────────────────────
+function bindFilters() {
+  function filtrar() {
+    const q    = $('doc-search').value.toLowerCase();
+    const tipo = $('doc-filter-type').value;
+    const tema = $('doc-filter-theme').value;
+    const fil  = allDocs.filter(d => {
+      const matchQ    = !q    || (d.title||'').toLowerCase().includes(q) || (d.theme||'').toLowerCase().includes(q);
+      const matchTipo = !tipo || d.source_type === tipo;
+      const matchTema = !tema || d.theme === tema;
+      return matchQ && matchTipo && matchTema;
+    });
+    renderDocs(fil);
+  }
+  $('doc-search').addEventListener('input', filtrar);
+  $('doc-filter-type').addEventListener('change', filtrar);
+  $('doc-filter-theme').addEventListener('change', filtrar);
+}
+
+// ── Upload manual ─────────────────────────────────────────
+let pendingFile = null;
+
+function bindUpload() {
+  $('upload-file').addEventListener('change', e => {
+    pendingFile = e.target.files[0];
+    if (!pendingFile) return;
+    $('upload-filename').textContent = pendingFile.name;
+    $('upload-panel').classList.remove('hidden');
+  });
+
+  $('btn-do-upload').addEventListener('click', async () => {
+    if (!pendingFile) return;
+    const btn = $('btn-do-upload');
+    btn.textContent = 'Subiendo…'; btn.disabled = true;
+
+    const fd = new FormData();
+    fd.append('file', pendingFile);
+    fd.append('source_type', $('upload-type').value);
+    fd.append('theme', $('upload-theme').value.trim() || '');
+
+    try {
+      const resp = await fetch('/api/rag/upload/', {method:'POST', body: fd});
+      const doc  = await resp.json();
+      $('upload-panel').classList.add('hidden');
+      $('upload-file').value = '';
+      pendingFile = null;
+      allDocs = await api.get('/api/rag/documents/');
+      renderDocs(allDocs);
+      // Auto-abrir análisis del doc recién subido
+      abrirAnalisis(doc.id, doc.title || pendingFile?.name || 'Doc subido');
+    } catch(e) {
+      alert('Error al subir: ' + e.message);
+    } finally {
+      btn.textContent = 'Subir y analizar'; btn.disabled = false;
+    }
+  });
+}
+
+function cancelUpload() {
+  $('upload-panel').classList.add('hidden');
+  $('upload-file').value = '';
+  pendingFile = null;
+}
+
+// ── Análisis ──────────────────────────────────────────────
+function abrirAnalisis(docId, titulo) {
+  currentDocId = docId;
+  currentAnalysis = null;
+  $('analysis-doc-title').textContent = titulo.slice(0, 50);
+  $('analysis-panel').classList.remove('hidden');
+  $('analysis-result').innerHTML = '<div class="loading">Selecciona un tipo de análisis…</div>';
+  document.querySelectorAll('.atab').forEach(t => t.classList.remove('active'));
+  document.querySelector('.atab[data-type="summary"]').classList.add('active');
+  runAnalysis('summary');
+}
+
+async function runAnalysis(type) {
+  if (!currentDocId) return;
+  document.querySelectorAll('.atab').forEach(t => t.classList.toggle('active', t.dataset.type === type));
+  $('analysis-result').innerHTML = '<div class="loading">Analizando…</div>';
+
+  const result = await api.post(`/api/rag/analyze/${currentDocId}?analysis_type=${type}`, {});
+  currentAnalysis = {type, result};
+  renderAnalysisResult(type, result);
+}
+
+function renderAnalysisResult(type, r) {
+  let html = '';
+  if (r.error) {
+    html = `<div class="error">${esc(r.error)}</div>`;
+  } else if (type === 'summary') {
+    html = `<div class="analysis-text">${esc(r.summary || r.text || JSON.stringify(r))}</div>`;
+  } else if (type === 'keywords') {
+    const kws = r.keywords || r || [];
+    html = Array.isArray(kws)
+      ? kws.map(k => `<span class="term-tag shared">${esc(typeof k === 'string' ? k : k.text || k.word)}</span>`).join('')
+      : esc(JSON.stringify(kws));
+  } else if (type === 'entities') {
+    const ents = r.entities || r || [];
+    html = Array.isArray(ents)
+      ? `<table class="ent-table"><tr><th>Entidad</th><th>Tipo</th><th>N</th></tr>
+          ${ents.slice(0,30).map(e => `<tr><td>${esc(e.text)}</td><td>${esc(e.label)}</td><td>${e.count||1}</td></tr>`).join('')}
+        </table>`
+      : esc(JSON.stringify(ents));
+  } else if (type === 'bias') {
+    const b = r.bias_score ?? r.score ?? null;
+    const pct = b !== null ? Math.round(b * 100) : null;
+    html = b !== null ? `
+      <div class="bias-result">
+        <div class="bias-label">Score epistémico</div>
+        <div class="bias-bar-wrap">
+          <span style="color:var(--jade)">SIT</span>
+          <div class="bias-bar">
+            <div class="bias-fill" style="width:${pct}%;background:var(--copper)"></div>
+          </div>
+          <span style="color:var(--copper)">HEG</span>
+        </div>
+        <div class="bias-numbers">
+          <span>Sim HEG: ${(r.sim_hegemonic||0).toFixed(3)}</span>
+          <span>Sim SIT: ${(r.sim_situated||0).toFixed(3)}</span>
+          <span>Tipo dominante: <strong>${esc(r.dominant_type||'—')}</strong></span>
+        </div>
+      </div>` : `<div class="analysis-text">${esc(JSON.stringify(r, null, 2))}</div>`;
+  }
+  $('analysis-result').innerHTML = html;
+}
+
+function cerrarAnalisis() {
+  $('analysis-panel').classList.add('hidden');
+  currentDocId = null;
+}
+
+async function eliminarDoc(id) {
+  if (!confirm('¿Eliminar este documento?')) return;
+  await api.del(`/api/rag/documents/${id}`);
+  allDocs = allDocs.filter(d => d.id !== id);
+  renderDocs(allDocs);
+  if (currentDocId === id) cerrarAnalisis();
+}
+
+function crearNotaDesdeAnalisis() {
+  if (!currentAnalysis || !currentDocId) return;
+  const doc   = allDocs.find(d => d.id === currentDocId);
+  const title = `Análisis: ${doc?.title?.slice(0,40) || 'Doc #'+currentDocId}`;
+  const content = `# ${title}\n\n**Tipo:** ${currentAnalysis.type}\n\n${JSON.stringify(currentAnalysis.result, null, 2)}`;
+  localStorage.setItem('tekia-nueva-nota', JSON.stringify({title, content, theme: doc?.theme||'', tags:[currentAnalysis.type]}));
+  window.location.href = '/notes';
+}
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+{% endblock %}

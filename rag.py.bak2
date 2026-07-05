@@ -1,0 +1,117 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from typing import Optional
+
+from app.database import get_db
+from app.models.document import Document
+from app.services.rag_service import RAGService
+
+router = APIRouter(prefix="/api/rag", tags=["rag"])
+
+
+class DownloadRequest(BaseModel):
+    url: str
+    source_type: str = "hegemonic"
+    theme: Optional[str] = None
+
+
+class DocumentCreate(BaseModel):
+    title: str
+    source: str
+    source_type: str = "hegemonic"
+    theme: Optional[str] = None
+
+
+@router.post("/documents/")
+def create_document(body: DocumentCreate, db: Session = Depends(get_db)):
+    doc = Document(**body.model_dump())
+    db.add(doc); db.commit(); db.refresh(doc)
+    return doc
+
+
+@router.get("/documents/")
+def list_documents(source_type: Optional[str] = None, theme: Optional[str] = None,
+                   db: Session = Depends(get_db)):
+    q = db.query(Document)
+    if source_type: q = q.filter(Document.source_type == source_type)
+    if theme: q = q.filter(Document.theme == theme)
+    return q.all()
+
+
+@router.post("/download/")
+def download(body: DownloadRequest, db: Session = Depends(get_db)):
+    svc = RAGService(db)
+    doc = svc.download_document(body.url, body.source_type, body.theme)
+    return doc
+
+
+@router.post("/search/")
+def search(body: dict, db: Session = Depends(get_db)):
+    svc = RAGService(db)
+    return svc.search(body.get("query", ""), k=body.get("k", 5))
+
+
+@router.post("/analyze/{doc_id}")
+def analyze(doc_id: int, analysis_type: str = "summary", db: Session = Depends(get_db)):
+    svc = RAGService(db)
+    return svc.analyze(doc_id, analysis_type)
+
+@router.post("/index/{doc_id}")
+def index_doc(doc_id: int, db: Session = Depends(get_db)):
+    return RAGService(db).index_document(doc_id)
+
+
+# ── Búsqueda web con auto-clasificación ──────────────────
+@router.get("/search-web/")
+def search_web(q: str, max_results: int = 8):
+    from duckduckgo_search import DDGS
+    HEG_DOMAINS = {
+        "reforma.com","eleconomista.com.mx","milenio.com","eluniversal.com.mx",
+        "expansion.mx","forbes.com.mx","reuters.com","bbc.com","nytimes.com",
+        "larazon.com.mx","excelsior.com.mx","informador.mx","jornada.com.mx",
+    }
+    import requests, urllib.parse
+    from bs4 import BeautifulSoup
+    try:
+        resp = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": q},
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+            timeout=15
+        )
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = []
+        for item in soup.select(".web-result")[:max_results]:
+            a    = next((l for l in item.select("a[href*='uddg']") if len(l.get_text(strip=True)) > 10), None)
+            snip = item.select_one(".result__snippet")
+            if not a: continue
+            raw  = ("https:" + a["href"]) if a["href"].startswith("//") else a["href"]
+            url  = urllib.parse.parse_qs(urllib.parse.urlparse(raw).query).get("uddg", [raw])[0]
+            dom  = url.replace("https://","").replace("http://","").split("/")[0].replace("www.","")
+            results.append({
+                "title": a.get_text(strip=True),
+                "href":  url,
+                "body":  snip.get_text(strip=True) if snip else "",
+                "auto_type": "hegemonic" if any(d in dom for d in HEG_DOMAINS) else "situated"
+            })
+        return results
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+# ── Grieta epistémica ─────────────────────────────────────
+class GrietaRequest(BaseModel):
+    heg: list = []
+    sit: list = []
+
+@router.post("/grieta/")
+def generar_grieta(body: GrietaRequest, db: Session = Depends(get_db)):
+    from app.services.grieta_service import GrietaService
+    return GrietaService(db).generar(body.heg, body.sit)
+
+
+# ── Indexar documento ─────────────────────────────────────
+@router.post("/index/{doc_id}")
+def index_doc(doc_id: int, db: Session = Depends(get_db)):
+    return RAGService(db).index_document(doc_id)
